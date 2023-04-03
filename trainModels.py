@@ -3,7 +3,7 @@ import numpy as np
 import pickle
 import os
 import time
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 from backtrader import Cerebro, Strategy, Broker
@@ -76,7 +76,7 @@ def train_model(X, y):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     # Initialize and train the Random Forest Classifier
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X_train, y_train)
 
     # Make predictions on the test set
@@ -140,13 +140,12 @@ def backtest_model(symbol, model, X_full, y_full):
 
             # Replace with your feature extraction logic
             features = # ...
-
-            prediction = model.predict([features])[0]
+            
             position = self.getposition(self.data).size
-
-            if prediction == 1 and position == 0:
+            gain_prediction = self.model.predict(features.reshape(1, -1))[0]
+            if gain_prediction > self.buy_threshold and position == 0:
                 self.buy()
-            elif prediction == -1 and position != 0:
+            elif gain_prediction < -self.sell_threshold and position != 0:
                 self.sell()
 
     # Set up the backtesting environment
