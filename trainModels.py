@@ -5,35 +5,37 @@ import os
 import time
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
-from backtrader import Cerebro, Strategy, Broker
+from sklearn.metrics import r2_score
+import backtrader
 import backtrader as bt
 import ta
 from datetime import datetime, timedelta
 import alpaca_trade_api as tradeapi
 import requests
+from copy import copy
+import json
+import random
 
-API_KEY = 'your_alpaca_api_key'
-API_SECRET = 'your_alpaca_secret_key'
+API_KEY = 'PKGP06EF93N8MC1QUB19'
+API_SECRET = 'dpWbBgaV3bABmBnldpYsAdn0DgyWacesaKEM1D1q'
 BASE_URL = 'https://data.alpaca.markets/v2/stocks'
 
 symbols = ["AAPL", "GOOG", "TSLA"]
-lookback_period = 365 * 2
+timeframe='1Hour'
+lookback_period_days = 365
+saved_dataset_size = 500
 models = {}
 backup_folder = "model_backups"
 models_file = 'models.pkl'
 
 headers = {'APCA-API-KEY-ID': API_KEY, 'APCA-API-SECRET-KEY': API_SECRET}
 
-def fetch_and_preprocess_data(symbol, lookback_period=365*2):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=lookback_period)
-    
+def fetch_and_preprocess_data(symbol, start_date, end_date, timeframe=timeframe):
     params = {
-        'timeframe': '1Day',
-        'start': start_date.isoformat(),
-        'end': end_date.isoformat(),
-        'limit': 1000
+        'timeframe': timeframe,
+        'start': start_date.isoformat() + "Z",
+        'end': end_date.isoformat() + "Z",
+        'limit': 10000
     }
     
     url = f"{BASE_URL}/{symbol}/bars"
@@ -68,8 +70,17 @@ def fetch_and_preprocess_data(symbol, lookback_period=365*2):
     X = data[features].values
     data['gain_pct_10'] = (data['c'].shift(-10) - data['c']) / data['c'] * 100
     y = data['gain_pct_10']
+    
+    data.rename(columns={
+        't': 'Date',
+        'o': 'Open',
+        'h': 'High',
+        'l': 'Low',
+        'c': 'Close',
+        'v': 'Volume',
+    }, inplace=True)
 
-    return X, y
+    return data, X, y
 
 def train_model(X, y):
     # Split the data into training and testing sets
@@ -83,15 +94,17 @@ def train_model(X, y):
     y_pred = model.predict(X_test)
 
     # Calculate the accuracy score
-    accuracy = accuracy_score(y_test, y_pred)
+    score = r2_score(y_test, y_pred)
 
-    return model, accuracy
+    return model, score
 
-def backtest_model(symbol, model, X_full, y_full):
-    # Define a custom strategy class using the provided model
+def backtest_model(symbol, model, data, buy_threshold=1, sell_threshold=1):
     class ModelBasedStrategy(bt.Strategy):
         params = (
             ('printlog', False),
+            ('model', None),
+            ('buy_threshold', 1),
+            ('sell_threshold', 1),
         )
 
         def __init__(self):
@@ -135,63 +148,54 @@ def backtest_model(symbol, model, X_full, y_full):
 
         def next(self):
             if not self.data_ready:
-                self.data_ready = len(self) > len(X_full)
+                self.data_ready = len(self) > len(data)
                 return
 
-            # Replace with your feature extraction logic
-            features = # ...
-            
+            current_date = self.datas[0].datetime.date(0)
+            current_data = data.loc[current_date]
+
+            # Calculate the features based on the current data
+            features = current_data[['RSI', 'BB_upper', 'BB_middle', 'BB_lower', 'MACD', 'MACD_signal']].values
+
             position = self.getposition(self.data).size
-            gain_prediction = self.model.predict(features.reshape(1, -1))[0]
-            if gain_prediction > self.buy_threshold and position == 0:
+            gain_prediction = model.predict(features.reshape(1, -1))[0]
+            if gain_prediction > buy_threshold and position == 0:
                 self.buy()
-            elif gain_prediction < -self.sell_threshold and position != 0:
+            elif gain_prediction < -sell_threshold and position != 0:
                 self.sell()
 
-    # Set up the backtesting environment
     cerebro = bt.Cerebro()
-    cerebro.addstrategy(ModelBasedStrategy)
-    
-    # Create a data feed for the symbol using the historical data (you can use any compatible data feed)
-    data_feed = bt.feeds.PandasData(dataname=X_full)  
-    cerebro.adddata(data_feed)
+    cerebro.addstrategy(ModelBasedStrategy, model=model, buy_threshold=buy_threshold, sell_threshold=sell_threshold)
 
-    # Run the backtest
+    
+    cerebro.adddata(data)
+
     cerebro.broker.setcash(100000.0)
     initial_value = cerebro.broker.getvalue()
     results = cerebro.run()
     final_value = cerebro.broker.getvalue()
 
-    # Calculate the accuracy and performance metrics
     strategy = results[0]
     accuracy = strategy.num_positive_trades / strategy.num_trades if strategy.num_trades > 0 else 0
     net_profit = final_value - initial_value
 
     return accuracy, net_profit
 
-def refine_model(symbol, model, X_old, y_old, X_new, y_new):
+def refine_model(symbol, model,  old_model, backtest_data, X, y):
     # Refine the model with the new data
-    model.fit(X_new, y_new)
-
-    # Combine the old and new data for backtesting
-    X_full = pd.concat([X_old, X_new], axis=0)
-    y_full = pd.concat([y_old, y_new], axis=0)
+    model.fit(X, y)
 
     # Backtest the refined model
-    accuracy, performance_metrics = backtest_model(symbol, model, X_full, y_full)
+    accuracy, net_profit = backtest_model(symbol, model, backtest_data)
+    accuracy_old, net_profit_old = backtest_model(symbol, old_model, backtest_data)
 
     # Check if the refined model meets your performance criteria
-    min_accuracy = 0.6
-    min_profit_factor = 1.5
-    if accuracy >= min_accuracy and performance_metrics['profit_factor'] >= min_profit_factor:
-        # Save the refined model
+    if net_profit < net_profit_old:
+        return old_model, accuracy_old, net_profit_old
+    else:
         models[symbol] = model
         save_models(models)
-    else:
-        # Discard the refined model and keep using the old one
-        pass
-
-    return accuracy, performance_metrics
+        return model, accuracy, net_profit
 
 def save_models(models, filename):
     with open(filename, "wb") as f:
@@ -202,10 +206,87 @@ def load_models(filename):
         models = pickle.load(f)
     return models
 
-def backup_models(models, backup_folder, interval=5*60*60):
+def backup_models(models, backup_folder):
     timestamp = int(time.time())
     backup_filename = os.path.join(backup_folder, f"models_backup_{timestamp}.pkl")
     save_models(models, backup_filename)
+    
+def get_and_save_datasets():
+    data_folder = "data"
+    
+    for symbol in symbols:
+        symbol_data_folder = os.path.join(data_folder, symbol)
+        os.makedirs(symbol_data_folder, exist_ok=True)
+
+        pickle_file = os.path.join(symbol_data_folder, f"{symbol}_data.pkl")
+
+        if os.path.exists(pickle_file):
+            print(f"Data for {symbol} already exists. Skipping...")
+            continue
+        
+        end_date = datetime.now() - timedelta(days=1)
+        start_date = end_date - timedelta(days=lookback_period_days)
+
+        data, X, y = fetch_and_preprocess_data(symbol, start_date, end_date)
+
+        data_length = len(data)
+        chunk_size = int(data_length / saved_dataset_size)
+        
+        if chunk_size < 1:
+            print(f"Warning: Chunk amount for {symbol} is less than 1. Consider increasing saved_dataset_size.")
+            continue
+
+        data_chunks = []
+        
+        for i in range(saved_dataset_size):
+            start_index = i * chunk_size
+            end_index = (i + 1) * chunk_size
+
+            chunk_data = data.iloc[start_index:end_index]
+            chunk_X = X[start_index:end_index]
+            chunk_y = y.iloc[start_index:end_index]
+            
+            start_timestamp = chunk_data.index.min().isoformat()
+            end_timestamp = chunk_data.index.max().isoformat()
+
+            data_chunk = {
+                'raw_data': chunk_data,
+                'X': chunk_X.tolist(),
+                'y': chunk_y.tolist(),
+                'start_timestamp': start_timestamp,
+                'end_timestamp': end_timestamp,
+                'is_used': False
+            }
+
+            data_chunks.append(data_chunk)
+
+        random.shuffle(data_chunks)
+        
+        pickle_file = os.path.join(symbol_data_folder, f"{symbol}_data.pkl")
+        with open(pickle_file, "wb") as f:
+            pickle.dump(data_chunks, f)
+
+def get_next_saved_dataset(symbol):
+    data_folder = "data"
+    symbol_data_folder = os.path.join(data_folder, symbol)
+    pickle_file = os.path.join(symbol_data_folder, f"{symbol}_data.pkl")
+
+    if not os.path.exists(pickle_file):
+        print(f"No saved data found for {symbol}. Please run get_and_save_datasets() first.")
+        return None
+
+    with open(pickle_file, "rb") as f:
+        data_chunks = pickle.load(f)
+
+    for data_chunk in data_chunks:
+        if not data_chunk["is_used"]:
+            data_chunk["is_used"] = True
+            with open(pickle_file, "wb") as f:
+                pickle.dump(data_chunks, f)
+            return data_chunk["raw_data"], np.array(data_chunk["X"]), np.array(data_chunk["y"])
+
+    print(f"All saved data for {symbol} has been used. Please run get_and_save_datasets() again.")
+    return None
 
 def main():
     
@@ -215,11 +296,18 @@ def main():
             models = pickle.load(f)
     else:
         models = {}
+        
+    #refresh data
+    get_and_save_datasets()
     
     for symbol in symbols:
         if symbol not in models:
-            # Fetch and preprocess data, then train the model
-            X, y = fetch_and_preprocess_data(symbol)
+            # Grab new data
+            data, X, y = get_next_saved_dataset(symbol)
+            
+            #if no unused data is availible, skip over this symbol.
+            if(data is None):
+                continue
             model, accuracy = train_model(X, y)
 
             # Save the new model and its accuracy in the dictionary
@@ -235,15 +323,30 @@ def main():
         start_time = time.time()
 
         for symbol in symbols:
-            # Fetch and preprocess new data for each symbol
-            X_old, y_old = fetch_and_preprocess_data(symbol, lookback_period)
-            X_new, y_new = fetch_and_preprocess_data(symbol, lookback_period, new_data=True)
+            
+            # Fetch and preprocess new data
+            data, X, y = get_next_saved_dataset(symbol)
+            backtest_data = get_next_saved_dataset(symbol)
+            
+            #if no unused data is availible for the first instance, skip over this symbol.
+            if(data is None):
+                continue
+            
+            #if the first query for data came through but the second did not, then split the data in half, one half for fitting and the other for backtesting.
+            if(backtest_data is None):
+                data_len = len(data)
+                half_len = data_len // 2
+                backtest_data = data.iloc[half_len:]
+                data = data.iloc[:half_len]
+                X = X[:half_len]
+                y = y[:half_len]
 
             # Load the existing model for the symbol
-            model = models[symbol]
+            model = models[symbol]['model']
 
             # Refine and backtest the model with the new data
-            refine_model(symbol, model, X_old, y_old, X_new, y_new)
+            currentModel = copy(model)
+            refine_model(symbol, model, currentModel, backtest_data, X , y)
 
             # Save the refined model
             models[symbol] = model
@@ -255,7 +358,7 @@ def main():
         end_time = time.time()
         training_time += end_time - start_time
 
-        if training_time >= 5 * 60 * 60:
+        if training_time >= 60 * 60:
             # Create a backup of the current models
             backup_models(models, backup_folder)
 
