@@ -3,10 +3,10 @@ import numpy as np
 import pickle
 import os
 import time
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import SGDRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
-import backtrader
+from sklearn.preprocessing import StandardScaler
 import backtrader as bt
 import ta
 from datetime import datetime, timedelta
@@ -15,6 +15,7 @@ import requests
 from copy import copy
 import json
 import random
+import pytz
 
 API_KEY = 'PKGP06EF93N8MC1QUB19'
 API_SECRET = 'dpWbBgaV3bABmBnldpYsAdn0DgyWacesaKEM1D1q'
@@ -23,31 +24,47 @@ BASE_URL = 'https://data.alpaca.markets/v2/stocks'
 symbols = ["AAPL", "GOOG", "TSLA"]
 timeframe='1Hour'
 lookback_period_days = 365
-saved_dataset_size = 500
+saved_dataset_size = 3000
 models = {}
 backup_folder = "model_backups"
 models_file = 'models.pkl'
 
 headers = {'APCA-API-KEY-ID': API_KEY, 'APCA-API-SECRET-KEY': API_SECRET}
 
-def fetch_and_preprocess_data(symbol, start_date, end_date, timeframe=timeframe):
+def fetch_and_preprocess_data(symbol, start_date, end_date, timeframe=timeframe, limit=10000):
+    tz = pytz.UTC
+    start_date = start_date.replace(tzinfo=tz)
+    end_date = end_date.replace(tzinfo=tz)
+    
     params = {
         'timeframe': timeframe,
-        'start': start_date.isoformat() + "Z",
-        'end': end_date.isoformat() + "Z",
-        'limit': 10000
+        'start': start_date.isoformat(),
+        'end': end_date.isoformat(),
+        'limit': limit
     }
+
+    all_data = []
+    while start_date < end_date:
+        params['start'] = start_date.isoformat()
+        url = f"{BASE_URL}/{symbol}/bars"
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+
+        raw_data = response.json()['bars']
+        
+        if len(raw_data) == 0:
+            break
+
+        all_data.extend(raw_data)
+        
+        # Update start_date to the timestamp of the last fetched candle + 1 time unit
+        last_timestamp = pd.to_datetime(raw_data[-1]['t'])
+        start_date = last_timestamp + pd.to_timedelta(f'1 {timeframe.lower()}')
     
-    url = f"{BASE_URL}/{symbol}/bars"
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()
-    
-    raw_data = response.json()['bars']
-    
-    data = pd.DataFrame(raw_data)
+    data = pd.DataFrame(all_data)
     data['t'] = pd.to_datetime(data['t'])
     data.set_index('t', inplace=True)
-    
+
     # Preprocess the data (handle missing data, normalization, etc.)
     data.dropna(inplace=True)
 
@@ -64,126 +81,73 @@ def fetch_and_preprocess_data(symbol, start_date, end_date, timeframe=timeframe)
     # Create feature matrix X and target vector y
     data.dropna(inplace=True)
     
-    #The order MUST be maintained otherwise it doesnt know which features are which
+    # The order MUST be maintained otherwise it doesnt know which features are which
     features = ['RSI', 'BB_upper', 'BB_middle', 'BB_lower', 'MACD', 'MACD_signal']
     
     X = data[features].values
     data['gain_pct_10'] = (data['c'].shift(-10) - data['c']) / data['c'] * 100
     y = data['gain_pct_10']
     
-    data.rename(columns={
-        't': 'Date',
-        'o': 'Open',
-        'h': 'High',
-        'l': 'Low',
-        'c': 'Close',
-        'v': 'Volume',
-    }, inplace=True)
-
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X)
     return data, X, y
 
 def train_model(X, y):
-    # Split the data into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
     # Initialize and train the Random Forest Classifier
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
+    model = SGDRegressor(random_state=42)
+    model.fit(X, y)
 
-    # Make predictions on the test set
-    y_pred = model.predict(X_test)
-
-    # Calculate the accuracy score
-    score = r2_score(y_test, y_pred)
-
-    return model, score
+    return model
 
 def backtest_model(symbol, model, data, buy_threshold=1, sell_threshold=1):
-    class ModelBasedStrategy(bt.Strategy):
-        params = (
-            ('printlog', False),
-            ('model', None),
-            ('buy_threshold', 1),
-            ('sell_threshold', 1),
-        )
+    cash = 100000
+    position = 0
+    buy_price = 0
+    num_positive_trades = 0
+    num_trades = 0
 
-        def __init__(self):
-            self.data_ready = False
-            self.order = None
-            self.buyprice = None
-            self.buycomm = None
-            self.num_positive_trades = 0
-            self.num_trades = 0
+    for index, row in data.iterrows():
+        X = row[['RSI', 'BB_upper', 'BB_middle', 'BB_lower', 'MACD', 'MACD_signal']].values
+        X = X.reshape(1, -1)
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X)
+        gain_prediction = model.predict(X)[0]
 
-        def notify_order(self, order):
-            if order.status in [order.Submitted, order.Accepted]:
-                return
+        if gain_prediction > buy_threshold and position == 0:
+            num_shares = cash // row['c']
+            if num_shares > 0:
+                position = num_shares
+                buy_price = row['c']
+                cash -= num_shares * buy_price
+            print(f"{symbol}: Buying at {row['c']} (gain_prediction: {gain_prediction})")
 
-            if order.status in [order.Completed]:
-                if order.isbuy():
-                    self.log('BUY EXECUTED, Price: {:.2f}, Cost: {:.2f}, Comm {:.2f}'.format(
-                        order.executed.price,
-                        order.executed.value,
-                        order.executed.comm
-                    ))
-                    self.buyprice = order.executed.price
-                    self.buycomm = order.executed.comm
-                elif order.issell():
-                    profit = order.executed.price - self.buyprice
-                    if profit > 0:
-                        self.num_positive_trades += 1
-                    self.num_trades += 1
-                    self.log('SELL EXECUTED, Price: {:.2f}, Profit: {:.2f}, Comm {:.2f}'.format(
-                        order.executed.price,
-                        profit,
-                        order.executed.comm
-                    ))
+        elif gain_prediction < -sell_threshold and position > 0:
+            cash += position * row['c']
+            profit = position * (row['c'] - buy_price)
+            if profit > 0:
+                num_positive_trades += 1
+            num_trades += 1
+            position = 0
+            print(f"{symbol}: Selling at {row['c']} (gain_prediction: {gain_prediction})")
 
-            self.order = None
+    # Account for remaining position
+    if position > 0:
+        cash += position * data['c'].iloc[-1]
+        profit = position * (data['c'].iloc[-1] - buy_price)
+        if profit > 0:
+            num_positive_trades += 1
+        num_trades += 1
 
-        def log(self, txt, dt=None, doprint=False):
-            if self.params.printlog or doprint:
-                dt = dt or self.datas[0].datetime.date(0)
-                print(f'{dt.isoformat()}, {txt}')
-
-        def next(self):
-            if not self.data_ready:
-                self.data_ready = len(self) > len(data)
-                return
-
-            current_date = self.datas[0].datetime.date(0)
-            current_data = data.loc[current_date]
-
-            # Calculate the features based on the current data
-            features = current_data[['RSI', 'BB_upper', 'BB_middle', 'BB_lower', 'MACD', 'MACD_signal']].values
-
-            position = self.getposition(self.data).size
-            gain_prediction = model.predict(features.reshape(1, -1))[0]
-            if gain_prediction > buy_threshold and position == 0:
-                self.buy()
-            elif gain_prediction < -sell_threshold and position != 0:
-                self.sell()
-
-    cerebro = bt.Cerebro()
-    cerebro.addstrategy(ModelBasedStrategy, model=model, buy_threshold=buy_threshold, sell_threshold=sell_threshold)
-
-    
-    cerebro.adddata(data)
-
-    cerebro.broker.setcash(100000.0)
-    initial_value = cerebro.broker.getvalue()
-    results = cerebro.run()
-    final_value = cerebro.broker.getvalue()
-
-    strategy = results[0]
-    accuracy = strategy.num_positive_trades / strategy.num_trades if strategy.num_trades > 0 else 0
+    final_value = cash
+    initial_value = 100000
     net_profit = final_value - initial_value
+    accuracy = num_positive_trades / num_trades if num_trades > 0 else 0
 
     return accuracy, net_profit
 
 def refine_model(symbol, model,  old_model, backtest_data, X, y):
     # Refine the model with the new data
-    model.fit(X, y)
+    model.partial_fit(X, y)
 
     # Backtest the refined model
     accuracy, net_profit = backtest_model(symbol, model, backtest_data)
@@ -193,8 +157,6 @@ def refine_model(symbol, model,  old_model, backtest_data, X, y):
     if net_profit < net_profit_old:
         return old_model, accuracy_old, net_profit_old
     else:
-        models[symbol] = model
-        save_models(models)
         return model, accuracy, net_profit
 
 def save_models(models, filename):
@@ -273,7 +235,7 @@ def get_next_saved_dataset(symbol):
 
     if not os.path.exists(pickle_file):
         print(f"No saved data found for {symbol}. Please run get_and_save_datasets() first.")
-        return None
+        return None, None, None
 
     with open(pickle_file, "rb") as f:
         data_chunks = pickle.load(f)
@@ -286,7 +248,7 @@ def get_next_saved_dataset(symbol):
             return data_chunk["raw_data"], np.array(data_chunk["X"]), np.array(data_chunk["y"])
 
     print(f"All saved data for {symbol} has been used. Please run get_and_save_datasets() again.")
-    return None
+    return None, None, None
 
 def main():
     
@@ -308,11 +270,11 @@ def main():
             #if no unused data is availible, skip over this symbol.
             if(data is None):
                 continue
-            model, accuracy = train_model(X, y)
+            model = train_model(X, y)
 
             # Save the new model and its accuracy in the dictionary
-            models[symbol] = {'model': model, 'accuracy': accuracy}
-            
+            models[symbol] = {'model': model}
+            print(f"Model created for {symbol}")
 
     # Save the models to a file using pickle
     save_models(models, "models.pkl")
@@ -326,14 +288,12 @@ def main():
             
             # Fetch and preprocess new data
             data, X, y = get_next_saved_dataset(symbol)
-            backtest_data = get_next_saved_dataset(symbol)
-            
+            backtest_data, _, _, = get_next_saved_dataset(symbol)
             #if no unused data is availible for the first instance, skip over this symbol.
             if(data is None):
-                continue
-            
-            #if the first query for data came through but the second did not, then split the data in half, one half for fitting and the other for backtesting.
-            if(backtest_data is None):
+                if(backtest_data is None):
+                    continue
+                #if the first query for data came through but the second did not, then split the data in half, one half for fitting and the other for backtesting.
                 data_len = len(data)
                 half_len = data_len // 2
                 backtest_data = data.iloc[half_len:]
@@ -346,11 +306,11 @@ def main():
 
             # Refine and backtest the model with the new data
             currentModel = copy(model)
-            refine_model(symbol, model, currentModel, backtest_data, X , y)
-
+            model, accuracy, net_profit = refine_model(symbol, model, currentModel, backtest_data, X , y)
             # Save the refined model
-            models[symbol] = model
-
+            models[symbol] = {'model': model, 'accuracy': accuracy}
+            print(f"Model refined for {symbol} with an accuracy of {accuracy:.4f} and net profit of {net_profit:.2f}")
+            
         # Save the refined models to a file using pickle
         save_models(models, "models.pkl")
 
